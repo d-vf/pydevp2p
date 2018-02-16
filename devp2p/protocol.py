@@ -1,9 +1,9 @@
 import gevent
 import rlp
 from rlp import sedes
-from multiplexer import Packet
-from service import WiredService
-import slogging
+from .multiplexer import Packet
+from .service import WiredService
+from devp2p import slogging
 log = slogging.get_logger('protocol')
 
 
@@ -47,6 +47,7 @@ class BaseProtocol(gevent.Greenlet):
         - define structure for rlp de/endcoding by sedes
             - list(arg_name, rlp.sedes.type), ...)  # for structs
             - sedes.CountableList(sedes.type)       # for lists with uniform item type
+        - if you want non-strict decoding, define decode_strict = False
         optionally implement
         - create
         - receive
@@ -55,6 +56,7 @@ class BaseProtocol(gevent.Greenlet):
         """
         cmd_id = 0
         structure = []  # [(arg_name, rlp.sedes.type), ...]
+        decode_strict = True
 
         def create(self, proto, *args, **kargs):
             "optionally implement create"
@@ -93,11 +95,11 @@ class BaseProtocol(gevent.Greenlet):
             if isinstance(cls.structure, sedes.CountableList):
                 decoder = cls.structure
             else:
-                decoder = sedes.List([x[1] for x in cls.structure])
+                decoder = sedes.List([x[1] for x in cls.structure], strict=cls.decode_strict)
             try:
-                data = rlp.decode(str(rlp_data), sedes=decoder)
+                data = rlp.decode(rlp_data, sedes=decoder)
             except (AssertionError, rlp.RLPException, TypeError) as e:
-                print repr(rlp.decode(rlp_data))
+                print(repr(rlp.decode(rlp_data)))
                 raise e
             if isinstance(cls.structure, sedes.CountableList):
                 return data
@@ -107,7 +109,7 @@ class BaseProtocol(gevent.Greenlet):
         # end command base ###################################################
 
     def __init__(self, peer, service):
-        "hint: implement peer_started notifcation of associated protocol here"
+        "hint: implement peer_started notification of associated protocol here"
         assert isinstance(service, WiredService)
         assert callable(peer.send_packet)
         self.is_stopped = False
@@ -162,7 +164,7 @@ class BaseProtocol(gevent.Greenlet):
         try:
             cmd(packet)
         except ProtocolError as e:
-            log.warn('protocol exception, stopping', error=e)
+            log.debug('protocol exception, stopping', error=e, peer=self.peer)
             self.stop()
 
     def send_packet(self, packet):

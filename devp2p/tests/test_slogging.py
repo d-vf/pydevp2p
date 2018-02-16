@@ -1,7 +1,10 @@
 import logging
 import unittest
 from devp2p import slogging
-from StringIO import StringIO
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 
 
 class LoggingTest(unittest.TestCase):
@@ -18,11 +21,14 @@ class LoggingTest(unittest.TestCase):
     def tearDown(self):
         self.log.removeHandler(self.handler)
 
-    def expect_log(self, msg):
+    def expect_log(self, msg, *parts):
         self.handler.flush()
         # FIXME: slogging adds unnecessary space in the end in some cases.
         # Workaround with rstrip().
-        self.assertEqual(self.stream.getvalue().rstrip(), msg.rstrip())
+        log_messages = self.stream.getvalue().rstrip()
+        self.assertTrue(log_messages.startswith(msg.rstrip()))
+        for part in parts:
+            self.assertIn(part, log_messages)
 
 
 class LoggingPatchTest(LoggingTest):
@@ -52,4 +58,4 @@ class SloggingTest(LoggingTest):
     def test_slogging_kwargs(self):
         """Test patched kwargs support"""
         self.log.info("Test kwargs:", number=1, f=2.3, comment='works!')
-        self.expect_log("Test kwargs: comment=works! number=1 f=2.3\n")
+        self.expect_log("Test kwargs:", "comment=works!", "number=1", "f=2.3")

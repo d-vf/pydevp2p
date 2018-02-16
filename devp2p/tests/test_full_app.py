@@ -1,3 +1,5 @@
+import platform
+
 import pytest
 import os
 import time
@@ -32,8 +34,8 @@ class ExampleServiceIncCounter(ExampleService):
             assert p.remote_client_version != my_version
 
         # check the peers is connected to distinct nodes
-        my_peers_with_hello_received = filter(lambda p: p.remote_client_version != '', my_peers)
-        versions = map(lambda p: p.remote_client_version, my_peers_with_hello_received)
+        my_peers_with_hello_received = list(filter(lambda p: p.remote_client_version != '', my_peers))
+        versions = list(map(lambda p: p.remote_client_version, my_peers_with_hello_received))
         self.log('versions', versions=versions)
         assert len(set(versions)) == len(versions)
 
@@ -104,7 +106,7 @@ class ExampleServiceIncCounter(ExampleService):
         self.log("ASSERT", broadcasted=len(self.broadcasted), collected=len(self.collected))
         assert len(self.collected) > len(self.broadcasted)
 
-        for turn in xrange(1, self.testdriver.COUNTER_LIMIT):
+        for turn in range(1, self.testdriver.COUNTER_LIMIT):
             if (turn-1) % self.testdriver.NUM_NODES == self.config['node_num']:
                 assert turn in self.broadcasted
             else:
@@ -156,21 +158,27 @@ class ExampleServiceAppDisconnect(ExampleService):
 
 @pytest.mark.parametrize('num_nodes', [3, 6])
 class TestFullApp:
-    @pytest.mark.timeout(30)
+    @pytest.mark.timeout(60)
     def test_inc_counter_app(self, num_nodes):
         class TestDriver(object):
             NUM_NODES = num_nodes
-            COUNTER_LIMIT = 1024
+            COUNTER_LIMIT = 256
             NODES_PASSED_SETUP = set()
             NODES_PASSED_INC_COUNTER = set()
 
         ExampleServiceIncCounter.testdriver = TestDriver()
 
-        app_helper.run(ExampleApp, ExampleServiceIncCounter,
-                       num_nodes=num_nodes, min_peers=num_nodes-1, max_peers=num_nodes-1)
+        app_helper.run(
+            ExampleApp,
+            ExampleServiceIncCounter,
+            num_nodes=num_nodes,
+            min_peers=num_nodes-1,
+            max_peers=num_nodes-1,
+            random_port=True  # Use a random port to avoid 'Address already in use' errors
+        )
 
 
-@pytest.mark.timeout(10)
+@pytest.mark.timeout(20)
 def test_app_restart():
     """
     Test scenario:
@@ -188,7 +196,7 @@ def test_app_restart():
                    num_nodes=3, min_peers=2, max_peers=2)
 
 
-@pytest.mark.timeout(15)
+@pytest.mark.timeout(30)
 def test_disconnect():
     """
     Test scenario:
@@ -206,7 +214,7 @@ def test_disconnect():
     app_helper.assert_config = lambda a, b, c, d: True
 
     app_helper.run(ExampleApp, ExampleServiceAppDisconnect,
-                   num_nodes=3, min_peers=2, max_peers=1)
+                   num_nodes=3, min_peers=2, max_peers=1, random_port=True)
 
 
 if __name__ == "__main__":

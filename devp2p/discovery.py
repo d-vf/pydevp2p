@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
-
+import re
 import time
+from socket import AF_INET, AF_INET6
+
+from repoze.lru import LRUCache
 import gevent
 import gevent.socket
-from socket import AF_INET, AF_INET6
-from devp2p import crypto
-import rlp
-from devp2p import utils
-from devp2p import kademlia
-from service import BaseService
-from gevent.server import DatagramServer
-import slogging
 import ipaddress
+import rlp
+from rlp.utils import decode_hex, is_integer, str_to_bytes, bytes_to_str, safe_ord
+from gevent.server import DatagramServer
+
+from devp2p import slogging
+from devp2p import crypto
+from devp2p import kademlia
+from devp2p import utils
+from .service import BaseService
+from .upnp import add_portmap, remove_portmap
+
 
 log = slogging.get_logger('p2p.discovery')
 
@@ -34,6 +40,11 @@ class PacketExpired(DefectiveMessage):
 enc_port = lambda p: utils.ienc4(p)[-2:]
 dec_port = utils.idec
 
+import sys
+PY3 = sys.version_info[0] >= 3
+
+ip_pattern = re.compile(b"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|([0-9a-f]{0,4}:)*([0-9a-f]{0,4})?$")
+
 
 class Address(object):
 
@@ -46,29 +57,22 @@ class Address(object):
     def __init__(self, ip, udp_port, tcp_port=0, from_binary=False):
         tcp_port = tcp_port or udp_port
         if from_binary:
-            assert len(ip) in (4, 16), repr(ip)
             self.udp_port = dec_port(udp_port)
             self.tcp_port = dec_port(tcp_port)
         else:
-            assert isinstance(udp_port, (int, long))
-            assert isinstance(tcp_port, (int, long))
-            ip = unicode(ip)
+            assert is_integer(udp_port)
+            assert is_integer(tcp_port)
             self.udp_port = udp_port
             self.tcp_port = tcp_port
         try:
-            self._ip = ipaddress.ip_address(ip)
-        except ValueError:
-            # Possibly a hostname - try resolving it
-            # We only want v4 or v6 addresses
-            # see https://docs.python.org/2/library/socket.html#socket.getaddrinfo
-            ips = [
-                unicode(ai[4][0])
-                for ai in gevent.socket.getaddrinfo(ip, None)
-                if ai[0] == AF_INET
-                or (ai[0] == AF_INET6 and ai[4][3] == 0)
-            ]
-            # Arbitrarily choose the first of the resolved addresses
-            self._ip = ipaddress.ip_address(ips[0])
+            # `ip` could be in binary or ascii format, independent of
+            # from_binary's truthy. We use ad-hoc regexp to determine format
+            _ip = str_to_bytes(ip)
+            _ip = (bytes_to_str(ip) if PY3 else unicode(ip)) if ip_pattern.match(_ip) else _ip
+            self._ip = ipaddress.ip_address(_ip)
+        except ipaddress.AddressValueError as e:
+            log.debug("failed to parse ip", error=e, ip=ip)
+            raise e
 
     @property
     def ip(self):
@@ -99,8 +103,8 @@ class Address(object):
     to_endpoint = to_binary
 
     @classmethod
-    def from_binary(self, ip, udp_port, tcp_port='\x00\x00'):
-        return Address(ip, udp_port, tcp_port, from_binary=True)
+    def from_binary(cls, ip, udp_port, tcp_port='\x00\x00'):
+        return cls(ip, udp_port, tcp_port, from_binary=True)
     from_endpoint = from_binary
 
 
@@ -119,7 +123,8 @@ class Node(kademlia.Node):
         return cls(pubkey, Address(ip, int(port)))
 
     def to_uri(self):
-        return utils.host_port_pubkey_to_uri(self.address.ip, self.address.udp_port, self.pubkey)
+        return utils.host_port_pubkey_to_uri(str_to_bytes(self.address.ip),
+            self.address.udp_port, self.pubkey)
 
 
 class DiscoveryProtocolTransport(object):
@@ -193,18 +198,22 @@ class DiscoveryProtocol(kademlia.WireInterface):
     cmd_id_map = dict(ping=1, pong=2, find_node=3, neighbours=4)
     rev_cmd_id_map = dict((v, k) for k, v in cmd_id_map.items())
 
+    # number of required top-level list elements for each cmd_id.
+    # elements beyond this length are trimmed.
+    cmd_elem_count_map = dict(ping=4, pong=3, find_node=2, neighbours=2)
+
     encoders = dict(cmd_id=chr,
                     expiration=rlp.sedes.big_endian_int.serialize)
 
-    decoders = dict(cmd_id=ord,
+    decoders = dict(cmd_id=safe_ord,
                     expiration=rlp.sedes.big_endian_int.deserialize)
 
     def __init__(self, app, transport):
         self.app = app
         self.transport = transport
-        self.privkey = app.config['node']['privkey_hex'].decode('hex')
+        self.privkey = decode_hex(app.config['node']['privkey_hex'])
         self.pubkey = crypto.privtopub(self.privkey)
-        self.nodes = dict()   # nodeid->Node,  fixme should be loaded
+        self.nodes = LRUCache(2048)   # nodeid->Node,  fixme should be loaded
         self.this_node = Node(self.pubkey, self.transport.address)
         self.kademlia = KademliaProtocolAdapter(self.this_node, wire=self)
         this_enode = utils.host_port_pubkey_to_uri(self.app.config['discovery']['listen_host'],
@@ -214,12 +223,12 @@ class DiscoveryProtocol(kademlia.WireInterface):
 
     def get_node(self, nodeid, address=None):
         "return node or create new, update address if supplied"
-        assert isinstance(nodeid, str)
-        assert len(nodeid) == 512 / 8
-        assert address or (nodeid in self.nodes)
-        if nodeid not in self.nodes:
-            self.nodes[nodeid] = Node(nodeid, address)
-        node = self.nodes[nodeid]
+        assert isinstance(nodeid, bytes)
+        assert len(nodeid) == 512 // 8
+        assert address or self.nodes.get(nodeid)
+        if not self.nodes.get(nodeid):
+            self.nodes.put(nodeid, Node(nodeid, address))
+        node = self.nodes.get(nodeid)
         if address:
             assert isinstance(address, Address)
             node.address = address
@@ -267,7 +276,7 @@ class DiscoveryProtocol(kademlia.WireInterface):
         assert cmd_id in self.cmd_id_map.values()
         assert isinstance(payload, list)
 
-        cmd_id = self.encoders['cmd_id'](cmd_id)
+        cmd_id = str_to_bytes(self.encoders['cmd_id'](cmd_id))
         expiration = self.encoders['expiration'](int(time.time() + self.expiration))
         encoded_data = rlp.encode(payload + [expiration])
         signed_data = crypto.sha3(cmd_id + encoded_data)
@@ -290,7 +299,7 @@ class DiscoveryProtocol(kademlia.WireInterface):
         """
         mdc = message[:32]
         if mdc != crypto.sha3(message[32:]):
-            log.warn('packet with wrong mcd')
+            log.debug('packet with wrong mcd')
             raise WrongMAC()
         signature = message[32:97]
         assert len(signature) == 65
@@ -300,12 +309,11 @@ class DiscoveryProtocol(kademlia.WireInterface):
         # if not crypto.verify(remote_pubkey, signature, signed_data):
         #     raise InvalidSignature()
         cmd_id = self.decoders['cmd_id'](message[97])
-        assert cmd_id in self.cmd_id_map.values()
-        payload = rlp.decode(message[98:])
+        cmd = self.rev_cmd_id_map[cmd_id]
+        payload = rlp.decode(message[98:], strict=False)
         assert isinstance(payload, list)
-        expiration = self.decoders['expiration'](payload.pop())
-        if time.time() > expiration:
-            raise PacketExpired()
+        # ignore excessive list elements as required by EIP-8.
+        payload = payload[:self.cmd_elem_count_map.get(cmd, len(payload))]
         return remote_pubkey, cmd_id, payload, mdc
 
     def receive(self, address, message):
@@ -313,12 +321,19 @@ class DiscoveryProtocol(kademlia.WireInterface):
         assert isinstance(address, Address)
         try:
             remote_pubkey, cmd_id, payload, mdc = self.unpack(message)
+            # Note: as of discovery version 4, expiration is the last element for all
+            # packets. This might not be the case for a later version, but just popping
+            # the last element is good enough for now.
+            expiration = self.decoders['expiration'](payload.pop())
+            if time.time() > expiration:
+                raise PacketExpired()
         except DefectiveMessage:
             return
         cmd = getattr(self, 'recv_' + self.rev_cmd_id_map[cmd_id])
         nodeid = remote_pubkey
-        if nodeid not in self.nodes:  # set intermediary address
-            self.get_node(nodeid, address)
+        remote = self.get_node(nodeid, address)
+        log.debug("Dispatching received message", local=self.this_node, remoteid=remote,
+                  cmd=self.rev_cmd_id_map[cmd_id])
         cmd(nodeid, payload, mdc)
 
     def send(self, node, message):
@@ -376,12 +391,8 @@ class DiscoveryProtocol(kademlia.WireInterface):
             return
         node = self.get_node(nodeid)
         log.debug('<<< ping', node=node)
-        version = rlp.sedes.big_endian_int.deserialize(payload[0])
-        if version != self.version:
-            log.error('wrong version', remote_version=version, expected_version=self.version)
-            return
         remote_address = Address.from_endpoint(*payload[1])  # from address
-        my_address = Address.from_endpoint(*payload[2])  # my address
+        #my_address = Address.from_endpoint(*payload[2])  # my address
         self.get_node(nodeid).address.update(remote_address)
         self.kademlia.recv_ping(node, echo=mdc)
 
@@ -410,11 +421,11 @@ class DiscoveryProtocol(kademlia.WireInterface):
             log.error('invalid pong payload', payload=payload)
             return
         assert len(payload[0]) == 3, payload
-        assert len(payload[0][0]) in (4, 16), payload
 
-        my_address = Address.from_endpoint(*payload[0])
+        # Verify address is valid
+        Address.from_endpoint(*payload[0])
         echoed = payload[1]
-        if nodeid in self.nodes:
+        if self.nodes.get(nodeid):
             node = self.get_node(nodeid)
             self.kademlia.recv_pong(node, echoed)
         else:
@@ -435,10 +446,9 @@ class DiscoveryProtocol(kademlia.WireInterface):
             unsigned expiration;
         };
         """
-        assert isinstance(target_node_id, long)
-        target_node_id = utils.int_to_big_endian(target_node_id).rjust(kademlia.k_pubkey_size / 8,
-                                                                       '\0')
-        assert len(target_node_id) == kademlia.k_pubkey_size / 8
+        assert is_integer(target_node_id)
+        target_node_id = utils.int_to_big_endian(target_node_id).rjust(kademlia.k_pubkey_size // 8, b'\0')
+        assert len(target_node_id) == kademlia.k_pubkey_size // 8
         log.debug('>>> find_node', remoteid=node)
         message = self.pack(self.cmd_id_map['find_node'], [target_node_id])
         self.send(node, message)
@@ -472,36 +482,33 @@ class DiscoveryProtocol(kademlia.WireInterface):
         assert isinstance(neighbours, list)
         assert not neighbours or isinstance(neighbours[0], Node)
         nodes = []
+        neighbours = sorted(neighbours)
         for n in neighbours:
             l = n.address.to_endpoint() + [n.pubkey]
             nodes.append(l)
-        log.debug('>>> neighbours', remoteid=node, count=len(nodes))
+        log.debug('>>> neighbours', remoteid=node, count=len(nodes), local=self.this_node,
+                  neighbours=neighbours)
         # FIXME: don't brake udp packet size / chunk message / also when receiving
-        message = self.pack(self.cmd_id_map['neighbours'], [nodes][:12])  # FIXME
+        message = self.pack(self.cmd_id_map['neighbours'], [nodes[:12]])  # FIXME
         self.send(node, message)
 
     def recv_neighbours(self, nodeid, payload, mdc):
-        node = self.get_node(nodeid)
+        remote = self.get_node(nodeid)
         assert len(payload) == 1
         neighbours_lst = payload[0]
         assert isinstance(neighbours_lst, list)
-        log.debug('<<< neigbours', remoteid=node, count=len(neighbours_lst))
-        neighbours = []
-        neighbours_set = set(tuple(x) for x in neighbours_lst)
-        if len(neighbours_set) < len(neighbours_lst):
-            log.warn('received duplicates')
 
-        for n in neighbours_set:
-            if len(n) != 4 or len(n[0]) not in (4, 16):
-                log.error('invalid neighbours format', neighbours=n)
-                return
-            n = list(n)
+        neighbours = []
+        for n in neighbours_lst:
             nodeid = n.pop()
             address = Address.from_endpoint(*n)
             node = self.get_node(nodeid, address)
             assert node.address
             neighbours.append(node)
-        self.kademlia.recv_neighbours(node, neighbours)
+
+        log.debug('<<< neighbours', remoteid=remote, local=self.this_node, neighbours=neighbours,
+                  count=len(neighbours_lst))
+        self.kademlia.recv_neighbours(remote, neighbours)
 
 
 class NodeDiscovery(BaseService, DiscoveryProtocolTransport):
@@ -512,6 +519,7 @@ class NodeDiscovery(BaseService, DiscoveryProtocolTransport):
 
     name = 'discovery'
     server = None  # will be set to DatagramServer
+    nat_upnp = None
     default_config = dict(
         discovery=dict(
             listen_port=30303,
@@ -545,25 +553,31 @@ class NodeDiscovery(BaseService, DiscoveryProtocolTransport):
         try:
             self.server.sendto(message, (address.ip, address.udp_port))
         except gevent.socket.error as e:
-            log.critical('udp write error', errno=e.errno, reason=e.strerror)
-            log.critical('waiting for recovery')
-            gevent.sleep(5.)
+            log.debug('udp write error', address=address, errno=e.errno, reason=e.strerror)
+            log.debug('waiting for recovery')
+            gevent.sleep(0.5)
 
     def receive(self, address, message):
         assert isinstance(address, Address)
         self.protocol.receive(address, message)
 
     def _handle_packet(self, message, ip_port):
-        log.debug('handling packet', address=ip_port, size=len(message))
-        assert len(ip_port) == 2
-        address = Address(ip=ip_port[0], udp_port=ip_port[1])
-        self.receive(address, message)
+        try:
+            log.debug('handling packet', address=ip_port, size=len(message))
+            assert len(ip_port) == 2
+            address = Address(ip=ip_port[0], udp_port=ip_port[1])
+            self.receive(address, message)
+        except Exception as e:
+            log.debug("failed to handle discovery packet",
+                      error=e, message=message, ip_port=ip_port)
 
     def start(self):
         log.info('starting discovery')
         # start a listening server
         ip = self.app.config['discovery']['listen_host']
         port = self.app.config['discovery']['listen_port']
+        # nat port mappin
+        self.nat_upnp = add_portmap(port, 'UDP', 'Ethereum DEVP2P Discovery')
         log.info('starting listener', port=port, host=ip)
         self.server = DatagramServer((ip, port), handle=self._handle_packet)
         self.server.start()
@@ -581,7 +595,9 @@ class NodeDiscovery(BaseService, DiscoveryProtocolTransport):
 
     def stop(self):
         log.info('stopping discovery')
-        self.server.stop()
+        remove_portmap(self.nat_upnp, self.app.config['discovery']['listen_port'], 'UDP')
+        if self.server:
+            self.server.stop()
         super(NodeDiscovery, self).stop()
 
 if __name__ == '__main__':

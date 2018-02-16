@@ -1,3 +1,7 @@
+import platform
+
+import pytest
+
 from devp2p import peermanager, peer
 from devp2p import crypto
 from devp2p.app import BaseApp
@@ -7,14 +11,15 @@ import devp2p.p2p_protocol
 import time
 import gevent
 import copy
+from rlp.utils import encode_hex, decode_hex, str_to_bytes
 
 
 def get_connected_apps():
-    a_config = dict(p2p=dict(listen_host='127.0.0.1', listen_port=3000),
-                    node=dict(privkey_hex=crypto.sha3('a').encode('hex')))
+    a_config = dict(p2p=dict(listen_host='127.0.0.1', listen_port=3005),
+                    node=dict(privkey_hex=encode_hex(crypto.sha3(b'a'))))
     b_config = copy.deepcopy(a_config)
-    b_config['p2p']['listen_port'] = 3001
-    b_config['node']['privkey_hex'] = crypto.sha3('b').encode('hex')
+    b_config['p2p']['listen_port'] = 3006
+    b_config['node']['privkey_hex'] = encode_hex(crypto.sha3(b'b'))
 
     a_app = BaseApp(a_config)
     peermanager.PeerManager.register_with_app(a_app)
@@ -30,7 +35,7 @@ def get_connected_apps():
     # connect
     host = b_config['p2p']['listen_host']
     port = b_config['p2p']['listen_port']
-    pubkey = crypto.privtopub(b_config['node']['privkey_hex'].decode('hex'))
+    pubkey = crypto.privtopub(decode_hex(b_config['node']['privkey_hex']))
     a_peermgr.connect((host, port), remote_pubkey=pubkey)
 
     return a_app, b_app
@@ -67,7 +72,7 @@ def test_big_transfer():
     st = time.time()
 
     def cb(proto, **data):
-        print 'took', time.time() - st, len(data['raw_data'])
+        print('took', time.time() - st, len(data['raw_data']))
 
     b_protocol.receive_transfer_callbacks.append(cb)
     raw_data = '0' * 1 * 1000 * 100
@@ -108,10 +113,90 @@ def test_dumb_peer():
     b_app.stop()
     gevent.sleep(0.1)
 
+def test_offset_dispatch():
+    """ test offset-based cmd_id translation """
+
+    def make_mock_service(n, size):
+        class MockProtocol(devp2p.protocol.BaseProtocol):
+            protocol_id = n
+            max_cmd_id = size
+            name = str_to_bytes('mock%d' % n)
+            version = 1
+            def __init__(self, *args, **kwargs):
+                super(MockProtocol, self).__init__(*args, **kwargs)
+                self.cmd_by_id = ['mock_cmd%d' % i for i in range(size + 1)]
+
+        class MockService(devp2p.service.WiredService):
+            name = 'mock%d' % n
+            default_config = {}
+            wire_protocol = MockProtocol
+            def __init__(self):
+                pass
+        return MockService()
+
+    services = [
+        make_mock_service(2, 7),
+        make_mock_service(19, 1),
+    ]
+
+    class MockPeerManager(peermanager.PeerManager):
+        privkey = crypto.sha3(b'a')
+        pubkey = crypto.privtopub(privkey)
+        wired_services = services
+        config = {
+            'client_version_string': 'mock',
+            'p2p': {'listen_port': 3006},
+            'node': {
+                'privkey_hex': encode_hex(privkey),
+                'id': encode_hex(pubkey),
+            }}
+        def __init__(self):
+            pass
+
+    class MockConnection(object):
+        def getpeername(*_):
+            return "mock"
+
+    packets = []
+
+    def mock_add_packet(x):
+        packets.append(x)
+
+    class MockPacket(object):
+        def __init__(self, proto, cmd, cookie):
+            self.protocol_id = proto
+            self.cmd_id = cmd
+            self.__cookie = cookie
+
+    mpm = MockPeerManager()
+    p = peer.Peer(mpm, MockConnection())
+    mpm.peers = [p]
+    p.offset_based_dispatch = True
+    p.mux.add_packet = mock_add_packet
+    p.connect_service(services[0])
+    p.connect_service(services[1])
+    for i in range(8):
+        p.send_packet(MockPacket(2, i, 'protoA%d' % i))
+    for i in range(2):
+        p.send_packet(MockPacket(19, i, 'protoB%d' % i))
+    for i in range(8):
+        pkt = packets.pop(0)
+        proto, cmd_id = p.protocol_cmd_id_from_packet(pkt)
+        assert proto.protocol_id == 2
+        assert proto.name == b'mock2'
+        assert cmd_id == i
+    for i in range(2):
+        pkt = packets.pop(0)
+        proto, cmd_id = p.protocol_cmd_id_from_packet(pkt)
+        assert proto.protocol_id == 19
+        assert proto.name == b'mock19'
+        assert cmd_id == i
+
+    p.stop()
 
 def connect_go():
-    a_config = dict(p2p=dict(listen_host='127.0.0.1', listen_port=3000),
-                    node=dict(privkey_hex=crypto.sha3('a').encode('hex')))
+    a_config = dict(p2p=dict(listen_host='127.0.0.1', listen_port=3010),
+                    node=dict(privkey_hex=encode_hex(crypto.sha3(b'a'))))
 
     a_app = BaseApp(a_config)
     peermanager.PeerManager.register_with_app(a_app)
@@ -120,8 +205,7 @@ def connect_go():
     a_peermgr = a_app.services.peermanager
 
     # connect
-    pubkey = "6ed2fecb28ff17dec8647f08aa4368b57790000e0e9b33a7b91f32c41b6ca9ba21600e9a8c44248ce63a71544388c6745fa291f88f8b81e109ba3da11f7b41b9".decode(
-        'hex')
+    pubkey = decode_hex("6ed2fecb28ff17dec8647f08aa4368b57790000e0e9b33a7b91f32c41b6ca9ba21600e9a8c44248ce63a71544388c6745fa291f88f8b81e109ba3da11f7b41b9")
     a_peermgr.connect(('127.0.0.1', 30303), remote_pubkey=pubkey)
     gevent.sleep(50)
     a_app.stop()

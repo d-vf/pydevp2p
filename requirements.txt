@@ -1,11 +1,12 @@
-pyelliptic
+pyelliptic==1.5.7
 wheel
-gevent==1.1b3
-tinyrpc
+gevent>=1.1.0
 bitcoin
 ipaddress
 coverage
 tox
-c_secp256k1>=0.0.7
+coincurve>=5.0.1
 pycryptodome>=3.3.1
-rlp==0.4.4
+rlp>=0.6.0,<0.7.0
+miniupnpc
+repoze.lru

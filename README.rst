@@ -7,16 +7,13 @@ pydevp2p
    :target: https://gitter.im/ethereum/pydevp2p?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge
 
 .. image:: https://badge.fury.io/py/devp2p.png
-    :target: http://badge.fury.io/py/devp2p
+    :target: https://badge.fury.io/py/devp2p
 
 .. image:: https://travis-ci.org/ethereum/pydevp2p.png?branch=master
         :target: https://travis-ci.org/ethereum/pydevp2p
 
 .. image:: https://coveralls.io/repos/ethereum/pydevp2p/badge.svg
         :target: https://coveralls.io/r/ethereum/pydevp2p
-
-.. image:: https://pypip.in/d/devp2p/badge.png
-        :target: https://pypi.python.org/pypi/devp2p
 
 .. image:: https://readthedocs.org/projects/pydevp2p/badge/?version=latest
         :target: https://readthedocs.org/projects/pydevp2p/?badge=latest
@@ -35,8 +32,8 @@ RLPx provides a general-purpose transport and interface for applications to comm
 
 RLPx underpins the DEVp2p interface:
 
-* https://github.com/ethereum/wiki/wiki/ÐΞVp2p-Wire-Protocol
-* https://github.com/ethereum/wiki/wiki/libp2p-Whitepaper
+* `https://github.com/ethereum/wiki/wiki/ÐΞVp2p-Wire-Protocol <https://github.com/ethereum/wiki/wiki/ÐΞVp2p-Wire-Protocol>`_
+* `https://github.com/ethereum/wiki/wiki/libp2p-Whitepaper <https://github.com/ethereum/wiki/wiki/libp2p-Whitepaper>`_
 
 Full spec:
 
@@ -47,7 +44,7 @@ Dependencies
 
 On Ubuntu::
 
-    $ sudo apt-get install libssl-dev libffi-dev libtool
+    $ sudo apt-get install libssl-dev build-essential automake pkg-config libtool libffi-dev libgmp-dev
 
 Features
 --------

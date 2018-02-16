@@ -1,9 +1,9 @@
 import time
 import gevent
 from rlp import sedes
-from multiplexer import Packet
-from protocol import BaseProtocol
-import slogging
+from .multiplexer import Packet
+from .protocol import BaseProtocol
+from devp2p import slogging
 import collections
 
 
@@ -46,6 +46,7 @@ class ConnectionMonitor(gevent.Greenlet):
                 self.log.debug('unresponsive_peer', monitor=self)
                 self.proto.peer.report_error('not responding to ping')
                 self.proto.stop()
+                self.proto.peer.stop()
                 self.kill()
 
     def stop(self):
@@ -64,7 +65,7 @@ class P2PProtocol(BaseProtocol):
     https://github.com/ethereum/wiki/wiki/%C3%90%CE%9EVp2p-Wire-Protocol
     """
     protocol_id = 0
-    name = 'p2p'
+    name = b'p2p'
     version = 4
     max_cmd_id = 15
 
@@ -75,7 +76,11 @@ class P2PProtocol(BaseProtocol):
         assert callable(peer.stop)
         assert callable(peer.receive_hello)
         super(P2PProtocol, self).__init__(peer, service)
+
+        def _on_monitor_exit(mon):
+            peer.stop()
         self.monitor = ConnectionMonitor(self)
+        self.monitor.link(_on_monitor_exit)
 
     def stop(self):
         self.monitor.stop()
@@ -92,7 +97,6 @@ class P2PProtocol(BaseProtocol):
 
     class hello(BaseProtocol.command):
         cmd_id = 0
-
         structure = [
             ('version', sedes.big_endian_int),
             ('client_version_string', sedes.binary),
@@ -100,6 +104,9 @@ class P2PProtocol(BaseProtocol):
             ('listen_port', sedes.big_endian_int),
             ('remote_pubkey', sedes.binary)
         ]
+        # don't throw for additional list elements as
+        # mandated by EIP-8.
+        decode_strict = False
 
         def create(self, proto):
             return dict(version=proto.version,
@@ -115,10 +122,6 @@ class P2PProtocol(BaseProtocol):
             if data['remote_pubkey'] == proto.config['node']['id']:
                 log.debug('connected myself')
                 return proto.send_disconnect(reason=reasons.connected_to_self)
-            if data['version'] != proto.version:
-                log.debug('incompatible network protocols', peer=proto.peer,
-                          expected=proto.version, received=data['version'])
-                return proto.send_disconnect(reason=reasons.incompatibel_p2p_version)
 
             proto.peer.receive_hello(proto, **data)
             # super(hello, self).receive(proto, data)
@@ -146,7 +149,7 @@ class P2PProtocol(BaseProtocol):
             useless_peer = 3
             too_many_peers = 4
             already_connected = 5
-            incompatibel_p2p_version = 6
+            incompatible_p2p_version = 6
             null_node_identity_received = 7
             client_quitting = 8
             unexpected_identity = 9  # i.e. a different identity to a previous connection or

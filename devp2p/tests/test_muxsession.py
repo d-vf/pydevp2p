@@ -20,13 +20,12 @@ def test_session():
     proto = P2PProtocol(peer=PeerMock(), service=WiredService(BaseApp()))
     hello_packet = proto.create_hello()
 
-    responder_privkey = mk_privkey('secret1')
-    responder = MultiplexedSession(responder_privkey, hello_packet=hello_packet,
-                                   token_by_pubkey=dict())
+    responder_privkey = mk_privkey(b'secret1')
+    responder = MultiplexedSession(responder_privkey, hello_packet=hello_packet)
     p0 = 0
     responder.add_protocol(p0)
 
-    initiator_privkey = mk_privkey('secret2')
+    initiator_privkey = mk_privkey(b'secret2')
     initiator = MultiplexedSession(initiator_privkey, hello_packet=hello_packet,
                                    remote_pubkey=privtopub(responder_privkey))
     initiator.add_protocol(p0)
@@ -34,7 +33,6 @@ def test_session():
     # send auth
     msg = initiator.message_queue.get_nowait()
     assert msg  # auth_init
-    assert len(msg) == RLPxSession.auth_message_ct_length
     assert initiator.packet_queue.empty()
     assert not responder.is_initiator
 
@@ -45,7 +43,6 @@ def test_session():
 
     # send auth ack and hello
     ack_msg = responder.message_queue.get_nowait()
-    assert len(msg) >= RLPxSession.auth_ack_message_ct_length  # + hello
     hello_msg = responder.message_queue.get_nowait()
     assert hello_msg
 

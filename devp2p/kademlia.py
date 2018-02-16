@@ -14,13 +14,16 @@ the idle bucket-refresh interval is 3600 seconds.
 Aside from the previously described exclusions, node discovery closely follows system
 and protocol described by Maymounkov and Mazieres.
 """
-
-from utils import big_endian_to_int
-from crypto import sha3
 import operator
-import time
 import random
-import slogging
+import time
+from functools import total_ordering
+
+from devp2p import slogging
+from .crypto import sha3
+from .utils import big_endian_to_int
+from rlp.utils import encode_hex, is_integer, str_to_bytes
+
 log = slogging.get_logger('p2p.discovery.kademlia')
 
 
@@ -39,10 +42,11 @@ def random_nodeid():
     return random.randint(0, k_max_node_id)
 
 
+@total_ordering
 class Node(object):
 
     def __init__(self, pubkey):
-        assert len(pubkey) == 64 and isinstance(pubkey, str)
+        assert len(pubkey) == 64 and isinstance(pubkey, bytes)
         self.pubkey = pubkey
         if k_id_size == 512:
             self.id = big_endian_to_int(pubkey)
@@ -56,14 +60,24 @@ class Node(object):
     def id_distance(self, id):
         return self.id ^ id
 
+    def __lt__(self, other):
+        if not isinstance(other, self.__class__):
+            return super(Node, self).__lt__(other)
+        return self.id < other.id
+
     def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return super(Node, self).__eq__(other)
         return self.pubkey == other.pubkey
 
     def __ne__(self, other):
-        return not bool(self.pubkey == other.pubkey)
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.pubkey)
 
     def __repr__(self):
-        return '<Node(%s)>' % self.pubkey[:4].encode('hex')
+        return '<Node(%s)>' % encode_hex(self.pubkey[:4])
 
 
 class KBucket(object):
@@ -100,7 +114,7 @@ class KBucket(object):
         return self.midpoint ^ id
 
     def nodes_by_id_distance(self, id):
-        assert isinstance(id, (int, long))
+        assert is_integer(id)
         return sorted(self.nodes, key=operator.methodcaller('id_distance', id))
 
     @property
@@ -248,7 +262,7 @@ class RoutingTable(object):
         raise Exception
 
     def buckets_by_id_distance(self, id):
-        assert isinstance(id, (int, long))
+        assert is_integer(id)
         return sorted(self.buckets, key=operator.methodcaller('id_distance', id))
 
     def buckets_by_distance(self, node):
@@ -271,7 +285,7 @@ class RoutingTable(object):
         sorting by bucket.midpoint does not work in edge cases
         build a short list of k * 2 nodes and sort and shorten it
         """
-        assert isinstance(node, (Node, long, int))
+        assert isinstance(node, Node) or is_integer(node)
         if isinstance(node, Node):
             node = node.id
         nodes = []
@@ -287,7 +301,7 @@ class RoutingTable(object):
         """
         naive correct version simply compares all nodes
         """
-        assert isinstance(id, long)
+        assert is_integer(id)
         nodes = list(n for n in self if n.id_distance(id) <= distance)
         return sorted(nodes, key=operator.methodcaller('id_distance', id))
 
@@ -321,7 +335,7 @@ class FindNodeTask(object):
 
     def __init__(self, proto, targetid, via_node=None, timeout=k_request_timeout, callback=None):
         assert isinstance(proto, KademliaProtocol)
-        assert isinstance(targetid, long)
+        assert is_integer(targetid)
         assert not via_node or isinstance(via_node, Node)
         self.proto = proto
         self.targetid = targetid
@@ -411,22 +425,22 @@ class KademliaProtocol(object):
         if pingid and (pingid not in self._expected_pongs):
             assert pingid not in self._expected_pongs
             log.debug('surprising pong', remoteid=node,
-                      expected=_expected_pongs(), pingid=pingid.encode('hex')[:8])
+                      expected=_expected_pongs(), pingid=encode_hex(pingid)[:8])
             if pingid in self._deleted_pingids:
                 log.debug('surprising pong was deleted')
             else:
                 for key in self._expected_pongs:
                     if key.endswith(node.pubkey):
                         log.debug('waiting for ping from node, but echo mismatch', node=node,
-                                  expected_echo=key[:len(node.pubkey)][:8].encode('hex'),
-                                  received_echo=pingid[:len(node.pubkey)][:8].encode('hex'))
+                                  expected_echo=encode_hex(key[:len(node.pubkey)][:8]),
+                                  received_echo=encode_hex(pingid[:len(node.pubkey)][:8]))
             return
 
         # check for timed out pings and eventually evict them
-        for _pingid, (timeout, _node, replacement) in self._expected_pongs.items():
+        for _pingid, (timeout, _node, replacement) in list(self._expected_pongs.items()):
             if time.time() > timeout:
                 log.debug('deleting timedout node', remoteid=_node,
-                          pingid=_pingid.encode('hex')[:8])
+                          pingid=encode_hex(_pingid)[:8])
                 self._deleted_pingids.add(_pingid)  # FIXME this is for testing
                 del self._expected_pongs[_pingid]
                 self.routing.remove_node(_node)
@@ -470,17 +484,19 @@ class KademliaProtocol(object):
             rid = random.randint(bucket.start, bucket.end)
             self.find_node(rid)
 
-        # check and removed timedout find requests
-        for nodeid, timeout in self._find_requests.items():
-            if time.time() > timeout:
-                del self._find_requests[nodeid]
+        # check and removed timed out find requests
+        self._find_requests = {
+            nodeid: timeout
+            for nodeid, timeout in self._find_requests.items()
+            if time.time() <= timeout
+        }
 
         log.debug('updated', num_nodes=len(self.routing), num_buckets=len(self.routing.buckets))
 
     def _mkpingid(self, echoed, node):
         assert node.pubkey
-        pid = echoed + node.pubkey
-        log.debug('mkpingid', echoed=echoed.encode('hex'), node=node.pubkey.encode('hex'))
+        pid = str_to_bytes(echoed) + node.pubkey
+        log.debug('mkpingid', echoed=encode_hex(echoed), node=encode_hex(node.pubkey))
         return pid
 
     def ping(self, node, replacement=None):
@@ -497,7 +513,7 @@ class KademliaProtocol(object):
         assert pingid
         timeout = time.time() + k_request_timeout
         log.debug('set wait for pong from', remote=node, local=self.this_node,
-                  pingid=pingid.encode('hex')[:4])
+                  pingid=encode_hex(pingid)[:4])
         self._expected_pongs[pingid] = (timeout, node, replacement)
 
     def recv_ping(self, remote, echo):
@@ -515,7 +531,7 @@ class KademliaProtocol(object):
         "tcp addresses are only updated upon receipt of Pong packet"
         assert remote != self.this_node
         pingid = self._mkpingid(echoed, remote)
-        log.debug('recv pong', remote=remote, pingid=pingid.encode('hex')[:8], local=self.this_node)
+        log.debug('recv pong', remote=remote, pingid=encode_hex(pingid)[:8], local=self.this_node)
         # update address (clumsy fixme)
         if hasattr(remote, 'address'):  # not available in tests
             nnodes = self.routing.neighbours(remote)
@@ -530,7 +546,7 @@ class KademliaProtocol(object):
 
     def find_node(self, targetid, via_node=None):
         # FIXME, amplification attack (need to ping pong ping pong first)
-        assert isinstance(targetid, long)
+        assert is_integer(targetid)
         assert not via_node or isinstance(via_node, Node)
         self._find_requests[targetid] = time.time() + k_request_timeout
         if via_node:
@@ -547,14 +563,14 @@ class KademliaProtocol(object):
         add all nodes to the list
         """
         assert isinstance(neighbours, list)
-        log.debug('recv neighbours', remoteid=remote, num=len(
-            neighbours), local=self.this_node, neighbours=neighbours)
+        log.debug('recv neighbours', remoteid=remote, num=len(neighbours), local=self.this_node,
+                  neighbours=neighbours)
         neighbours = [n for n in neighbours if n != self.this_node]
         neighbours = [n for n in neighbours if n not in self.routing]
 
         # we don't map requests to responses, thus forwarding to all FIXME
         for nodeid, timeout in self._find_requests.items():
-            assert isinstance(nodeid, long)
+            assert is_integer(nodeid)
             closest = sorted(neighbours, key=operator.methodcaller('id_distance', nodeid))
             if time.time() < timeout:
                 closest_known = self.routing.neighbours(nodeid)
@@ -576,7 +592,7 @@ class KademliaProtocol(object):
     def recv_find_node(self, remote, targetid):
         # FIXME, amplification attack (need to ping pong ping pong first)
         assert isinstance(remote, Node)
-        assert isinstance(targetid, long)
+        assert is_integer(targetid)
         self.update(remote)
         found = self.routing.neighbours(targetid)
         log.debug('recv find_node', remoteid=remote, found=len(found))

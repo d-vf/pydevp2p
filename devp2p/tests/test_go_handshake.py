@@ -4,6 +4,7 @@
 
 from devp2p.rlpxcipher import RLPxSession
 from devp2p.crypto import ECCx, privtopub
+from rlp.utils import decode_hex
 test_values = \
     {
         "initiator_private_key": "5e173f6ac3c669587538e7727cf19b782a4f2fda07c1eaa662c593e5e85e3051",
@@ -27,7 +28,7 @@ test_values = \
     }
 
 for k, v in test_values.items():
-    test_values[k] = v.decode('hex')
+    test_values[k] = decode_hex(v)
 
 
 keys = ['initiator_private_key',
@@ -86,8 +87,7 @@ def test_handshake():
 
     # test auth_msg plain
     auth_msg = initiator.create_auth_message(remote_pubkey=responder_pubkey,
-                                             ephemeral_privkey=tv[
-                                                 'initiator_ephemeral_private_key'],
+                                             ephemeral_privkey=tv['initiator_ephemeral_private_key'],
                                              nonce=tv['initiator_nonce'])
 
     # test auth_msg plain
@@ -110,12 +110,9 @@ def test_handshake():
     assert auth_msg[65:] == tv['auth_plaintext'][65:]  # starts with non deterministic k
 
     responder.decode_authentication(auth_msg_cipher)
-    auth_ack_msg = responder.create_auth_ack_message(responder_ephemeral_pubkey,
-                                                     tv['receiver_nonce'],
-                                                     responder.remote_token_found
-                                                     )
+    auth_ack_msg = responder.create_auth_ack_message(responder_ephemeral_pubkey, nonce=tv['receiver_nonce'])
     assert auth_ack_msg == tv['authresp_plaintext']
-    auth_ack_msg_cipher = responder.encrypt_auth_ack_message(auth_ack_msg, responder.remote_pubkey)
+    auth_ack_msg_cipher = responder.encrypt_auth_ack_message(auth_ack_msg, remote_pubkey=responder.remote_pubkey)
 
     # set auth ack msg cipher (needed later for mac calculation)
     responder.auth_ack = tv['authresp_ciphertext']
@@ -148,11 +145,11 @@ def test_handshake():
     from rlp.codec import consume_item
 
     header = r['header']
-    frame_length = struct.unpack('>I', '\x00' + header[:3])[0]
+    frame_length = struct.unpack(b'>I', b'\x00' + header[:3])[0]
 
     header_sedes = sedes.List([sedes.big_endian_int, sedes.big_endian_int])
     header_data = rlp.decode(header[3:], strict=False, sedes=header_sedes)
-    print 'header', repr(header_data)
+    print('header', repr(header_data))
 
     # frame
     frame = r['frame']
@@ -160,7 +157,7 @@ def test_handshake():
     # normal: rlp(packet-type) [|| rlp(packet-data)] || padding
     packet_type, end = consume_item(frame, start=0)
     packet_type = rlp.decode(frame, sedes=sedes.big_endian_int, strict=False)
-    print 'packet_type', repr(packet_type)
+    print('packet_type', repr(packet_type))
 
     # decode hello body
     _sedes_capabilites_tuple = sedes.List([sedes.binary, sedes.big_endian_int])
@@ -176,4 +173,4 @@ def test_handshake():
     hello_sedes = sedes.List([x[1] for x in structure])
     frame_data = rlp.decode(frame[end:], sedes=hello_sedes)
     frame_data = dict((structure[i][0], x) for i, x in enumerate(frame_data))
-    print 'frame', frame_data
+    print('frame', frame_data)
